@@ -1,5 +1,5 @@
 CraftOrders.registerModdedCraftOrder(OrderType.AutoTrader, {
-    title = "AutoTrader",
+    title = "Auto Trader",
     callback = "onUserAutoTraderOrder"
 })
 
@@ -25,7 +25,7 @@ function CraftOrders.autoTrader()
     if checkCaptain() then
         CraftOrders.removeSpecialOrders()
 
-        -- Entity():addScriptOnce("ai/autoTrader.lua")
+        Entity():addScriptOnce("ai/autotrader.lua")
         return true
     end 
 end
