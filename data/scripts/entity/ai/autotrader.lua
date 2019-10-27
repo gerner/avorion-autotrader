@@ -9,25 +9,38 @@ JumpAI = include("entity/ai/jump")
 AutoTrader = {}
 
 States = {
+    Stuck = -1,
     Search = 0,
     TravelToBuy = 1,
     Buy = 2,
     TravelToSell = 3,
     Sell = 4,
     Done = 5
+
 }
 
 local wasInited = false
 local state = States.Search
 local route = nil
+local searchInterval = 1
 local noRouteNotificationTimer = 0
-
 local noRouteNotificationPeriod = 60
+
+-- rough time to travel to a station, dock, do transaction, undock
+-- in terms of jump cooldown
+-- this is just an estimate to compare routes in terms of profit/time
+local dockingOverheadTime = 3
+
+function AutoTrader.initialize()
+    -- kick tradingoverview to get data ready for us
+    Entity():invokeFunction("tradingoverview.lua", "getData")
+    searchInterval = 0.5
+    state = States.Search
+end
 
 function AutoTrader.canContinueAutoTrading()
     if not wasInited then return true end
     -- TODO: what's the stopping condition for auto trading?
-    -- return States.Done ~= state
     return true
 end
 
@@ -36,7 +49,9 @@ function AutoTrader.getUpdateInterval()
         return 1
     elseif state == States.Search then
         -- periodically search for an updated trade route
-        return 15
+        return searchInterval
+    elseif state == States.Stuck then
+        return 60
     else
         -- frequently update because we're doing active stuff like docking
         return 0.5
@@ -54,69 +69,17 @@ function AutoTrader.updateServer(timeStep)
     end
 
     if state == States.Search then
-        ShipAI():setStatus("Searching for a trade route /* ship AI status*/"%_T, {})
-
-        local foundRoute = AutoTrader.findRoute()
-        if foundRoute then
-            route = foundRoute
-
-            -- TODO: we could be a lot smarter about considering our own cargo when choosing a route
-            -- check if we have the cargo ourselves
-            local selfCargoBay = CargoBay():getCargos()
-            local selfCargos = {}
-
-            for tradingGood, amount in pairs(selfCargoBay) do
-                selfCargos[tradingGood.name] = amount
-            end
-
-            -- TODO: allow buying some stock and combining with our own cargo
-            -- TODO: consider cargo space
-            if not selfCargos[route.buyable.good.name] or selfCargos[route.buyable.good.name] <= (route.sellable.maxStock - route.sellable.stock) then
-                print("AutoTrader: have not enough units of %1%, travel to buy", route.buyable.good.name)
-                JumpAI.reset()
-                state = States.TravelToBuy
-            else
-                print("AutoTrader: have %1% units of %2%, travel to sell", selfCargos[route.buyable.good.name], route.buyable.good.name)
-                JumpAI.reset()
-                state = States.TravelToSell
-            end
-        else
-            print("no trade route found")
-            if noRouteNotificationTimer <= 0 then
-                noRouteNotificationTimer = noRouteNotificationPeriod
-
-                local faction = Faction(entity.factionIndex)
-                local x, y = Sector():getCoordinates()
-                local coords = tostring(x) .. ":" .. tostring(y)
-                local shipName = Entity().name or ""
-                local errorMessage = "Your ship in sector %s can't find any trade routes."%_T
-                local chatMessage = "Sir, we can't find any trade routes in \\s(%s)!"%_T
-                faction:sendChatMessage(shipName, ChatMessageType.Error, errorMessage, coords)
-                faction:sendChatMessage(shipName, ChatMessageType.Normal, chatMessage, coords)
-            else
-                noRouteNotificationTimer = noRouteNotificationTimer - timeStep
-            end
-        end
+        AutoTrader.StateSearch(timeStep, entity)
     elseif state == States.TravelToBuy then
-        ShipAI():setStatus("Traveling to ${x},${y} to buy ${good} /* ship AI status*/"%_T, {x = route.buyable.coords.x, y = route.buyable.coords.y, good = route.buyable.good.name})
-        JumpAI.updateJumpToSector(route.buyable.coords.x, route.buyable.coords.y, finishedJump)
+        AutoTrader.StateTravelToBuy(timeStep, entity)
     elseif state == States.Buy then
-        ShipAI():setStatus("Buying ${good} from ${stationName}"%_T, {good = route.buyable.good.name, stationName = (route.buyable.station%_t % route.buyable.titleArgs)})
-
-        local station = Sector():getEntity(route.buyable.stationIndex)
-        DockAI.updateDockingUndocking(timeStep, station, 5, doTransaction, finishedDock)
+        AutoTrader.StateBuy(timeStep, entity)
     elseif state == States.TravelToSell then
-        ShipAI():setStatus("Traveling to ${x},${y} to sell ${good} /* ship AI status*/"%_T, {x = route.sellable.coords.x, y = route.sellable.coords.y, good = route.sellable.good.name})
-        JumpAI.updateJumpToSector(route.buyable.coords.x, route.buyable.coords.y, finishedJump)
+        AutoTrader.StateTravelToSell(timeStep, entity)
     elseif state == States.Sell then
-        ShipAI():setStatus("Selling ${good} to ${stationName}"%_T, {good = route.buyable.good.name, stationName = (route.sellable.station%_t % route.sellable.titleArgs)})
-
-        local station = Sector():getEntity(route.sellable.stationIndex)
-        DockAI.updateDockingUndocking(timeStep, station, 5, doTransaction, finishedDock)
+        AutoTrader.StateSell(timeStep, entity)
     elseif state == States.Done then
-        -- TODO: just start again?
-        print("AutoTrader: search for route")
-        state = States.Search
+        AutoTrader.StateDone(timeStep, entity)
     else
         ShipAI():setStatus("Error in AutoTrader"%_T, {})
     end
@@ -129,21 +92,90 @@ end
 -- 4) travel to sell location
 -- 5) sell the good
 
-function sortRoutesByProfitDesc(a, b)
-    local a_volume = math.min(a.buyable.stock, a.sellable.maxStock - a.sellable.stock)
-    local a_profit = a_volume * (a.sellable.price - a.buyable.price)
-    local b_volume = math.min(b.buyable.stock, b.sellable.maxStock - b.sellable.stock)
-    local b_profit = a_volume * (b.sellable.price - b.buyable.price)
-    return b_profit < a_profit
+function AutoTrader.StateSearch(timeStep, entity)
+    ShipAI():setStatus("Searching for a trade route /* ship AI status*/"%_T, {})
+
+    -- TODO: consider multiple routes across a sequence of systems
+
+    local foundRoute = AutoTrader.findRoute()
+    if foundRoute then
+        print("AutoTrader: found a route")
+        printTable(foundRoute)
+        route = foundRoute
+
+        if route.amountToBuy > 0 then
+            print("AutoTrader: want to buy %1% units of %2%, travel to buy", route.amountToBuy, route.buyable.good.name)
+            JumpAI.reset()
+            state = States.TravelToBuy
+        else
+            print("AutoTrader: already have %1% units of %2%, travel to sell", route.amountToSell, route.buyable.good.name)
+            JumpAI.reset()
+            state = States.TravelToSell
+        end
+
+    else
+        print("AutoTrader: no trade route found, will continue to search")
+        -- let's wait a while before we look again
+        searchInterval = 30
+
+        -- periodically notify the player/faction
+        if noRouteNotificationTimer <= 0 then
+            noRouteNotificationTimer = noRouteNotificationPeriod
+
+            local faction = Faction(entity.factionIndex)
+            local x, y = Sector():getCoordinates()
+            local coords = tostring(x) .. ":" .. tostring(y)
+            local shipName = Entity().name or ""
+            local errorMessage = "Your ship in sector %s can't find any trade routes."%_T
+            local chatMessage = "Sir, we can't find any trade routes in \\s(%s)!"%_T
+            faction:sendChatMessage(shipName, ChatMessageType.Error, errorMessage, coords)
+            faction:sendChatMessage(shipName, ChatMessageType.Normal, chatMessage, coords)
+        else
+            noRouteNotificationTimer = noRouteNotificationTimer - timeStep
+        end
+    end
 end
 
-function AutoTrader.considerRoute(routeCandidate)
-    -- skip routes that have zero sellable goods
-    if routeCandidate.sellable.maxStock - routeCandidate.sellable.stock <= 0 then
-        return false
-    end
-    return true
+function AutoTrader.StateTravelToBuy(timeStep, entity)
+    ShipAI():setStatus("Traveling to ${x},${y} to buy ${amountToBuy} units of ${good} from ${stationName}"%_T, {x = route.buyable.coords.x, y = route.buyable.coords.y, amountToBuy = route.amountToBuy, good = route.buyable.good.name, stationName = (route.buyable.station%_t % route.buyable.titleArgs)})
+    JumpAI.updateJumpToSector(route.buyable.coords.x, route.buyable.coords.y, finishedJump)
 end
+
+function AutoTrader.StateBuy(timeStep, entity)
+    local station = Sector():getEntity(route.buyable.stationIndex)
+
+    -- TODO: make sure the station still exists and we can do our transaction
+    -- TODO: handle merchant ships to which we cannot dock
+
+    ShipAI():setStatus("Buying ${amountToBuy} units of ${good} from ${stationName} in ${x}:${y}"%_T, {amountToBuy = route.amountToBuy, good = route.buyable.good.name, stationName = (route.buyable.station%_t % route.buyable.titleArgs), x=route.buyable.coords.x, y=route.buyable.coords.y})
+    DockAI.updateDockingUndocking(timeStep, station, 5, doTransaction, finishedDock)
+end
+
+function AutoTrader.StateTravelToSell(timeStep, entity)
+    ShipAI():setStatus("Traveling to ${x},${y} to sell ${amountToSell} units of ${good} from ${stationName}"%_T, {x = route.sellable.coords.x, y = route.sellable.coords.y, amountToSell = route.amountToSell, good = route.sellable.good.name, stationName = (route.sellable.station%_t % route.sellable.titleArgs)})
+    JumpAI.updateJumpToSector(route.sellable.coords.x, route.sellable.coords.y, finishedJump)
+end
+
+function AutoTrader.StateSell(timeStep, entity)
+    local station = Sector():getEntity(route.sellable.stationIndex)
+
+    -- TODO: make sure the station still exists and we can do our transaction
+    -- TODO: handle merchant ships to which we cannot dock
+
+    ShipAI():setStatus("Selling ${amountToSell} units of ${good} to ${stationName} in ${x}:${y}"%_T, {amountToSell = route.amountToSell, good = route.sellable.good.name, stationName = (route.sellable.station%_t % route.sellable.titleArgs), x=route.sellable.coords.x, y=route.sellable.coords.y})
+    DockAI.updateDockingUndocking(timeStep, station, 5, doTransaction, finishedDock)
+end
+
+function AutoTrader.StateDone()
+    -- kick tradingoverview to get data ready for us
+    Entity():invokeFunction("tradingoverview.lua", "getData")
+
+    -- search right away
+    searchInterval = 0.5
+    state = States.Search
+end
+
+-- helpers
 
 function AutoTrader.findRoute()
     local ok, sellable, buyable, routes = Entity():invokeFunction("tradingoverview.lua", "getData")
@@ -152,14 +184,96 @@ function AutoTrader.findRoute()
         return nil
     end
 
-    printTable(routes)
 
-    -- most profit (= volume * margin) first
-    table.sort(routes, sortRoutesByProfitDesc)
+    -- check if we have the cargo ourselves
+    local cargoBay = CargoBay()
+    local selfCargos = {}
+    for good, amount in pairs(cargoBay:getCargos()) do
+        selfCargos[good.name] = amount
+    end
+    local freeCargo = cargoBay.freeSpace
+    local money = getParentFaction().money
+
+    local amountToBuyAndSell = function(money, freeCargo, amountOnHand, route)
+        amountOnHand = amountOnHand or 0
+        -- want to have as much as possible to saturate the destination
+        -- combination of self cargo stock plus amount we can buy
+        -- use self cargo first
+        -- limit by cargo capacity and current money
+        local maxSellable = route.sellable.maxStock - route.sellable.stock
+
+        local maxBuyable = route.buyable.stock
+        maxBuyable = math.min(maxBuyable, freeCargo / route.buyable.good.size)
+        maxBuyable = math.min(maxBuyable, money / route.buyable.price)
+
+        local amountToSell = math.min(maxSellable, amountOnHand + maxBuyable)
+        local amountToBuy = math.max(0, amountToSell - amountOnHand)
+
+        return amountToBuy, amountToSell
+    end
+
+    -- we're going to mess with the routes, so let's make a copy
+    routes = table.deepcopy(routes)
+
+    -- add pseudo routes to sell goods already on hand
+    for _, sellable in pairs(sellable) do
+        if selfCargos[sellable.good.name] and selfCargos[sellable.good.name] > 0 then
+            local buyable = {
+                good = sellable.good,
+                price = 9999999999,
+                stock = 0
+            }
+            table.insert(routes, {buyable = buyable, sellable = sellable})
+        end
+    end
+
+    local ship = Entity()
+    local x, y = Sector():getCoordinates()
     for _, routeCandidate in pairs(routes) do
-        if AutoTrader.considerRoute(routeCandidate) then
-            print("found a route")
-            printTable(routeCandidate)
+        local toBuy, toSell = amountToBuyAndSell(money, freeCargo, selfCargos[routeCandidate.buyable.good.name], routeCandidate)
+        routeCandidate.amountToBuy = toBuy
+        routeCandidate.amountToSell = toSell
+
+        -- profit is total sale minus cost to buy,
+        -- accounting for goods already on hand
+        routeCandidate.profit = toSell * routeCandidate.sellable.price - toBuy * routeCandidate.buyable.price
+
+        -- compute the number of jumps we have to make to reach destinations
+        if routeCandidate.amountToBuy > 0 then
+            routeCandidate.buyDist = JumpAI.estimateRouteLength(Entity(), x, y, routeCandidate.buyable.coords.x, routeCandidate.buyable.coords.y)
+        else
+            routeCandidate.buyDist = 0
+        end
+        routeCandidate.sellDist = JumpAI.estimateRouteLength(Entity(), routeCandidate.buyable.coords.x, routeCandidate.buyable.coords.y, routeCandidate.sellable.coords.x, routeCandidate.buyable.sellable.y)
+    end
+
+    -- sort by profit
+    local sortFn = function(a, b)
+        return a.profit > b.profit
+    end
+
+    -- sort by profit per unit time
+    -- local sortFn = function(a, b)
+    --    -- note we subtract 1 from the distances below because I assume the
+    --    -- first jump doesn't have to pay any cooldown overhead
+    --    local a_time = 0
+    --    if a.amountToBuy > 0 then
+    --        a_time = a_time + dockingOverheadTime + math.max(a.buyDist - 1, 0)
+    --    else
+    --    a_time = a_time + dockingOverheadTime + math.max(a.sellDist - 1, 0)
+
+    --    local b_time = 0
+    --    if b.amountToBuy > 0 then
+    --        b_time = b_time + dockingOverheadTime + math.max(b.buyDist - 1, 0)
+    --    else
+    --    b_time = b_time + dockingOverheadTime + math.max(b.sellDist - 1, 0)
+
+    --    return a.profit / a_time > b.profit / b_time
+    -- end
+
+    table.sort(routes, sortFn)
+    for _, routeCandidate in pairs(routes) do
+        if routeCandidate.amountToSell > 0 then
             return routeCandidate
         end
     end
@@ -171,13 +285,25 @@ end
 function finishedJump(ship, ok)
     JumpAI.reset()
     if not ok then
-        getParentFaction():sendChatMessage(ship.name, ChatMessageType.Error, "Can't find a route to ${destX}:${destY} from ${x}:${y}"%_T, {destX = destX, destY = destY, x = x, y = y})
+        local x,y = Sector():getCoordinates()
+
+        getParentFaction():sendChatMessage(ship.name, ChatMessageType.Error, "Can't find a jump route for trader in ${x}:${y}"%_T % {x=x,y=y})
+
+        if state == States.TravelToBuy then
+            getParentFaction():sendChatMessage(ship.name, ChatMessageType.Normal, "Sir, I can't find a jump path from ${x}:${y} to my trade buy in ${destX}:${destY}"%_T % {x=x,y=y,destX=route.buyable.x,destY=route.buyable.y})
+        elseif state == States.TravelToSell then
+            getParentFaction():sendChatMessage(ship.name, ChatMessageType.Normal, "Sir, I can't find a jump path from ${x}:${y} to my trade sell in ${destX}:${destY}"%_T % {x=x,y=y,destX=route.sellable.x,destY=route.sellable.y})
+        end
+        -- TODO: what should we do in this error state?
+        state = States.Stuck
     else
         if state == States.TravelToBuy then
+            -- TODO: check that our buy is still valid
             print("AutoTrader: buy")
             DockAI.reset()
             state = States.Buy
         elseif state == States.TravelToSell then
+            -- TODO: check that our sell is still valid
             print("AutoTrader: sell")
             DockAI.reset()
             state = States.Sell
@@ -200,15 +326,13 @@ function doTransaction(ship, station)
         invokedFnc = "sellToShip"
         script = route.buyable.script
 
-        -- TODO: also limit by budget and cargo space
-        amountToTrade = math.min(route.buyable.stock, route.sellable.maxStock - route.sellable.stock)
+        amountToTrade = route.amountToBuy
     elseif state == States.Sell then
         -- when the ship sells, the station buys from the ship
         invokedFnc = "buyFromShip"
         script = route.sellable.script
 
-        -- TODO: limit by amount on hand
-        amountToTrade = math.min(route.buyable.stock, route.sellable.maxStock - route.sellable.stock)
+        amountToTrade = route.amountToSell
     else
         print("AutoTrader was in a bad state ${state} for docking transaction" % {state=state})
     end
