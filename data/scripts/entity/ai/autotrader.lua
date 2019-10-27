@@ -62,9 +62,27 @@ function AutoTrader.updateServer(timeStep)
     wasInited = true
 
     local entity = Entity()
+
+    -- must have a trading system
     if not entity:hasScript("tradingoverview.lua") then
-        ShipAI():setStatus("You have to install a Trading System in the ship for AutoTrader to work."%_T, {})
         Faction():sendChatMessage("", ChatMessageType.Error, "You have to install a Trading System in the ship for Auto Trader to work."%_T)
+        ShipAI():setPassive()
+        terminate()
+        return
+    end
+
+    -- must not be a station
+    if entity.isStation then
+        Faction():sendChatMessage("", ChatMessageType.Error, "Stations can't auto trade."%_T)
+        ShipAI():setPassive()
+        terminate()
+        return
+    end
+
+    -- must have a captain
+    if entity.hasPilot or ((entity.playerOwned or entity.allianceOwned) and entity:getCrewMembers(CrewProfessionType.Captain) == 0) then
+        ShipAI():setPassive()
+        terminate()
         return
     end
 
@@ -145,10 +163,25 @@ function AutoTrader.StateBuy(timeStep, entity)
     local station = Sector():getEntity(route.buyable.stationIndex)
 
     -- TODO: make sure the station still exists and we can do our transaction
-    -- TODO: handle merchant ships to which we cannot dock
 
     ShipAI():setStatus("Buying ${amountToBuy} units of ${good} from ${stationName} in ${x}:${y}"%_T, {amountToBuy = route.amountToBuy, good = route.buyable.good.name, stationName = (route.buyable.station%_t % route.buyable.titleArgs), x=route.buyable.coords.x, y=route.buyable.coords.y})
-    DockAI.updateDockingUndocking(timeStep, station, 5, doTransaction, finishedDock)
+
+    if station:hasComponent(ComponentType.DockingPositions) then
+        -- dock with the station
+        DockAI.updateDockingUndocking(timeStep, station, 5, doTransaction, finishedDock)
+    else
+        -- merchant ship, fly close to it, as if we're going to dock
+        -- don't use CheckShipDocked from lib/player.lua because it will send
+        -- chat message errors
+        if station:getNearestDistance(entity) <= 50 then
+            -- close enough, do the transaction and we're done
+            doTransaction(entity, station)
+            finishedDock(entity, "Trading is now over")
+        else
+            -- need to get closer
+            ShipAI(entity):flyTo(station.translationf, 0)
+        end
+    end
 end
 
 function AutoTrader.StateTravelToSell(timeStep, entity)
@@ -170,8 +203,8 @@ function AutoTrader.StateDone()
     -- kick tradingoverview to get data ready for us
     Entity():invokeFunction("tradingoverview.lua", "getData")
 
-    -- search right away
-    searchInterval = 0.5
+    -- wait a few seconds for tradingoverview to catch up, then search
+    searchInterval = 5
     state = States.Search
 end
 
@@ -193,6 +226,8 @@ function AutoTrader.findRoute()
     end
     local freeCargo = cargoBay.freeSpace
     local money = getParentFaction().money
+    local x, y = Sector():getCoordinates()
+    local ship = Entity()
 
     local amountToBuyAndSell = function(money, freeCargo, amountOnHand, route)
         amountOnHand = amountOnHand or 0
@@ -221,14 +256,13 @@ function AutoTrader.findRoute()
             local buyable = {
                 good = sellable.good,
                 price = 9999999999,
+                coords = vec2(x, y),
                 stock = 0
             }
             table.insert(routes, {buyable = buyable, sellable = sellable})
         end
     end
 
-    local ship = Entity()
-    local x, y = Sector():getCoordinates()
     for _, routeCandidate in pairs(routes) do
         local toBuy, toSell = amountToBuyAndSell(money, freeCargo, selfCargos[routeCandidate.buyable.good.name], routeCandidate)
         routeCandidate.amountToBuy = toBuy
@@ -244,32 +278,29 @@ function AutoTrader.findRoute()
         else
             routeCandidate.buyDist = 0
         end
-        routeCandidate.sellDist = JumpAI.estimateRouteLength(Entity(), routeCandidate.buyable.coords.x, routeCandidate.buyable.coords.y, routeCandidate.sellable.coords.x, routeCandidate.buyable.sellable.y)
+        routeCandidate.sellDist = JumpAI.estimateRouteLength(Entity(), routeCandidate.buyable.coords.x, routeCandidate.buyable.coords.y, routeCandidate.sellable.coords.x, routeCandidate.sellable.coords.y)
+
+        -- note we subtract 1 from the distances below because I assume the
+        -- first jump doesn't have to pay any cooldown overhead
+        if routeCandidate.amountToBuy > 0 then
+            routeCandidate.routeTime = dockingOverheadTime + math.max(routeCandidate.buyDist - 1, 0)
+        else
+            routeCandidate.routeTime = 0
+        end
+        routeCandidate.routeTime = routeCandidate.routeTime + dockingOverheadTime + math.max(routeCandidate.sellDist - 1, 0)
+
+        print("%1% profit %2% time %3% p/t %4%", routeCandidate.buyable.good.name, routeCandidate.profit, routeCandidate.routeTime, routeCandidate.profit / routeCandidate.routeTime)
     end
 
     -- sort by profit
-    local sortFn = function(a, b)
-        return a.profit > b.profit
-    end
+    --local sortFn = function(a, b)
+    --    return a.profit > b.profit
+    --end
 
     -- sort by profit per unit time
-    -- local sortFn = function(a, b)
-    --    -- note we subtract 1 from the distances below because I assume the
-    --    -- first jump doesn't have to pay any cooldown overhead
-    --    local a_time = 0
-    --    if a.amountToBuy > 0 then
-    --        a_time = a_time + dockingOverheadTime + math.max(a.buyDist - 1, 0)
-    --    else
-    --    a_time = a_time + dockingOverheadTime + math.max(a.sellDist - 1, 0)
-
-    --    local b_time = 0
-    --    if b.amountToBuy > 0 then
-    --        b_time = b_time + dockingOverheadTime + math.max(b.buyDist - 1, 0)
-    --    else
-    --    b_time = b_time + dockingOverheadTime + math.max(b.sellDist - 1, 0)
-
-    --    return a.profit / a_time > b.profit / b_time
-    -- end
+    local sortFn = function(a, b)
+        return a.profit / a.routeTime > b.profit / b.routeTime
+    end
 
     table.sort(routes, sortFn)
     for _, routeCandidate in pairs(routes) do
@@ -340,7 +371,7 @@ function doTransaction(ship, station)
     if invokedFnc then
         local ok, ret = station:invokeFunction(script, invokedFnc, ship.index, good, amountToTrade, true)
         if ok == 0 then
-            print("traded ${amount} ${good}" % {amount = amountToTrade, good = good})
+            print("trading ${amount} ${good}" % {amount = amountToTrade, good = good})
         else
             print("error trading goods")
         end
@@ -353,10 +384,12 @@ function finishedDock(ship, msg)
     print("finished docking: %1%", msg)
     DockAI.reset()
     if state == States.Buy then
+        -- TODO: optionally kick any trade beacons in the sector to register their info
         print("AutoTrader: travel to sell")
         JumpAI.reset()
         state = States.TravelToSell
     elseif state == States.Sell then
+        -- TODO: optionally kick any trade beacons in the sector to register their info
         print("AutoTrader: done")
         state = States.Done
     else

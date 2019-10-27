@@ -70,7 +70,7 @@ end
 function JumpAI.estimateRouteLength(ship, x, y, destX, destY)
     local hyperspaceReach = ship.hyperspaceJumpReach
     local totalDist = distance(vec2(destX, destY), vec2(x, y))
-    return math.floor(totalDist / hyperspaceReach), math.floor(totalDist / hyperspaceReach)
+    return math.ceil(totalDist / hyperspaceReach), math.ceil(totalDist / hyperspaceReach)
 end
 
 return JumpAI
