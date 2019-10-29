@@ -26,6 +26,16 @@ local searchInterval = 1
 local noRouteNotificationTimer = 0
 local noRouteNotificationPeriod = 60
 
+--optional filters on buying and selling
+-- {
+--     coords = nil,
+--     distance = nil,
+--     script = nil,
+--     goodName = nil
+-- }
+local filterBuy = nil
+local filterSell = nil
+
 -- rough time to travel to a station, dock, do transaction, undock
 -- in terms of jump cooldown
 -- this is just an estimate to compare routes in terms of profit/time
@@ -34,9 +44,15 @@ local dockingOverheadTime = 3
 function AutoTrader.initialize()
     -- kick tradingoverview to get data ready for us
     Entity():invokeFunction("tradingoverview.lua", "getData")
+
+    -- TODO: handle being restored from disk
     searchInterval = 0.5
     state = States.Search
+
+    -- TODO: callbacks for cargo changing to keep track of trades actually working
 end
+
+-- TODO: secure and restore methods
 
 function AutoTrader.canContinueAutoTrading()
     if not wasInited then return true end
@@ -99,6 +115,7 @@ function AutoTrader.updateServer(timeStep)
     elseif state == States.Done then
         AutoTrader.StateDone(timeStep, entity)
     else
+        -- Stuck or some other unknown state
         ShipAI():setStatus("Error in AutoTrader"%_T, {})
     end
 end
@@ -115,7 +132,7 @@ function AutoTrader.StateSearch(timeStep, entity)
 
     -- TODO: consider multiple routes across a sequence of systems
 
-    local foundRoute = AutoTrader.findRoute()
+    local foundRoute = AutoTrader.findRoute(entity)
     if foundRoute then
         print("AutoTrader: found a route")
         printTable(foundRoute)
@@ -156,7 +173,7 @@ end
 
 function AutoTrader.StateTravelToBuy(timeStep, entity)
     ShipAI():setStatus("Traveling to ${x},${y} to buy ${amountToBuy} units of ${good} from ${stationName}"%_T, {x = route.buyable.coords.x, y = route.buyable.coords.y, amountToBuy = route.amountToBuy, good = route.buyable.good.name, stationName = (route.buyable.station%_t % route.buyable.titleArgs)})
-    JumpAI.updateJumpToSector(route.buyable.coords.x, route.buyable.coords.y, finishedJump)
+    JumpAI.updateJumpToSector(route.buyable.coords.x, route.buyable.coords.y, AutoTrader.finishedJump)
 end
 
 function AutoTrader.StateBuy(timeStep, entity)
@@ -166,42 +183,26 @@ function AutoTrader.StateBuy(timeStep, entity)
 
     ShipAI():setStatus("Buying ${amountToBuy} units of ${good} from ${stationName} in ${x}:${y}"%_T, {amountToBuy = route.amountToBuy, good = route.buyable.good.name, stationName = (route.buyable.station%_t % route.buyable.titleArgs), x=route.buyable.coords.x, y=route.buyable.coords.y})
 
-    if station:hasComponent(ComponentType.DockingPositions) then
-        -- dock with the station
-        DockAI.updateDockingUndocking(timeStep, station, 5, doTransaction, finishedDock)
-    else
-        -- merchant ship, fly close to it, as if we're going to dock
-        -- don't use CheckShipDocked from lib/player.lua because it will send
-        -- chat message errors
-        if station:getNearestDistance(entity) <= 50 then
-            -- close enough, do the transaction and we're done
-            doTransaction(entity, station)
-            finishedDock(entity, "Trading is now over")
-        else
-            -- need to get closer
-            ShipAI(entity):flyTo(station.translationf, 0)
-        end
-    end
+    AutoTrader.dockAndTrade(timeStep, entity, station)
 end
 
 function AutoTrader.StateTravelToSell(timeStep, entity)
     ShipAI():setStatus("Traveling to ${x},${y} to sell ${amountToSell} units of ${good} from ${stationName}"%_T, {x = route.sellable.coords.x, y = route.sellable.coords.y, amountToSell = route.amountToSell, good = route.sellable.good.name, stationName = (route.sellable.station%_t % route.sellable.titleArgs)})
-    JumpAI.updateJumpToSector(route.sellable.coords.x, route.sellable.coords.y, finishedJump)
+    JumpAI.updateJumpToSector(route.sellable.coords.x, route.sellable.coords.y, AutoTrader.finishedJump)
 end
 
 function AutoTrader.StateSell(timeStep, entity)
     local station = Sector():getEntity(route.sellable.stationIndex)
 
     -- TODO: make sure the station still exists and we can do our transaction
-    -- TODO: handle merchant ships to which we cannot dock
 
     ShipAI():setStatus("Selling ${amountToSell} units of ${good} to ${stationName} in ${x}:${y}"%_T, {amountToSell = route.amountToSell, good = route.sellable.good.name, stationName = (route.sellable.station%_t % route.sellable.titleArgs), x=route.sellable.coords.x, y=route.sellable.coords.y})
-    DockAI.updateDockingUndocking(timeStep, station, 5, doTransaction, finishedDock)
+    AutoTrader.dockAndTrade(timeStep, entity, station)
 end
 
-function AutoTrader.StateDone()
+function AutoTrader.StateDone(timeStep, entity)
     -- kick tradingoverview to get data ready for us
-    Entity():invokeFunction("tradingoverview.lua", "getData")
+    entity:invokeFunction("tradingoverview.lua", "getData")
 
     -- wait a few seconds for tradingoverview to catch up, then search
     searchInterval = 5
@@ -210,13 +211,87 @@ end
 
 -- helpers
 
-function AutoTrader.findRoute()
-    local ok, sellable, buyable, routes = Entity():invokeFunction("tradingoverview.lua", "getData")
+function AutoTrader.loadFilters(entity)
+    local buyCoords = entity:getValue("AutoTrader_filterBuy_coords")
+    if buyCoords ~= nil then
+        local x,y = string.match(buyCoords, "(-?[0-9]+):(-?[0-9]+)")
+        if not x or not y then
+            buyCoords = nil
+        else
+            buyCoords = vec2(tonumber(x), tonumber(y))
+        end
+    end
+    filterBuy = {
+        goodName = entity:getValue("AutoTrader_filterBuy_goodName"),
+        coords = buyCoords,
+        distance = entity:getValue("AutoTrader_filterBuy_distance"),
+        script = entity:getValue("AutoTrader_filterBuy_script"),
+        station = entity:getValue("AutoTrader_filterBuy_station")
+    }
+    if filterBuy.coords ~= nil and not filterBuy.distance then
+        filterBuy.distance = 0
+    end
+
+    local sellCoords = entity:getValue("AutoTrader_filterSell_coords")
+    if sellCoords ~= nil then
+        local x,y = string.match(buyCoords, "(-?[0-9]+):(-?[0-9]+)")
+        if not x or not y then
+            sellCoords = nil
+        else
+            sellCoords = vec2(tonumber(x), tonumber(y))
+        end
+    end
+    filterSell = {
+        goodName = entity:getValue("AutoTrader_filterSell_goodName"),
+        coords = sellCoords,
+        distance = entity:getValue("AutoTrader_filterSell_distance"),
+        script = entity:getValue("AutoTrader_filterSell_script"),
+        station = entity:getValue("AutoTrader_filterSell_station")
+    }
+    if filterSell.coords ~= nil and not filterSell.distance then
+        filterSell.distance = 0
+    end
+end
+
+function AutoTrader.filterTrade(filter, trade, coords)
+    -- no filter allows everything
+    if filter == nil then
+        return true
+    end
+
+    if filter.goodName ~= nil and not string.match(trade.good.name, filter.goodName) then
+        return false
+    end
+
+    if filter.coords ~= nil and distance(trade.coords, filter.coords) > filter.distance then
+        return false
+    elseif filter.distance ~= nil and distance(trade.coords, coords) > filter.distance then
+        return false
+
+    end
+
+    if filter.script ~= nil and not string.match(trade.script, filter.script) then
+        return false
+    end
+
+    if filter.station ~= nil and not string.match(trade.station, filter.station) then
+        return false
+    end
+
+    return true
+end
+
+function AutoTrader.findRoute(ship)
+    local x, y = Sector():getCoordinates()
+    local currentCoords = vec2(x, y)
+
+    AutoTrader.loadFilters(ship)
+
+    local ok, sellable, buyable, routes = ship:invokeFunction("tradingoverview.lua", "getData")
     if not ok then
         print("error communicating with trading overview")
         return nil
     end
-
 
     -- check if we have the cargo ourselves
     local cargoBay = CargoBay()
@@ -226,8 +301,6 @@ function AutoTrader.findRoute()
     end
     local freeCargo = cargoBay.freeSpace
     local money = getParentFaction().money
-    local x, y = Sector():getCoordinates()
-    local ship = Entity()
 
     local amountToBuyAndSell = function(money, freeCargo, amountOnHand, route)
         amountOnHand = amountOnHand or 0
@@ -257,7 +330,9 @@ function AutoTrader.findRoute()
                 good = sellable.good,
                 price = 9999999999,
                 coords = vec2(x, y),
-                stock = 0
+                stock = 0,
+                script = "self",
+                station = "self"
             }
             table.insert(routes, {buyable = buyable, sellable = sellable})
         end
@@ -304,16 +379,28 @@ function AutoTrader.findRoute()
 
     table.sort(routes, sortFn)
     for _, routeCandidate in pairs(routes) do
+        if not AutoTrader.filterTrade(filterBuy, routeCandidate.buyable, currentCoords) then
+            goto continue
+        end
+
         if routeCandidate.amountToSell > 0 then
+            if not AutoTrader.filterTrade(filterSell, routeCandidate.sellable, routeCandidate.buyable.coords) then
+                goto continue
+            end
             return routeCandidate
         end
+
+        -- TODO: any case where we'd consider buy-only route?
+        -- e.g. stockpiling goods
+
+        ::continue::
     end
 
     return nil
 end
 
 -- JumpAI functions
-function finishedJump(ship, ok)
+function AutoTrader.finishedJump(ship, ok)
     JumpAI.reset()
     if not ok then
         local x,y = Sector():getCoordinates()
@@ -345,7 +432,28 @@ function finishedJump(ship, ok)
 end
 
 -- DockAI functions
-function doTransaction(ship, station)
+
+function AutoTrader.dockAndTrade(timeStep, entity, station)
+    if station:hasComponent(ComponentType.DockingPositions) then
+        -- dock with the station
+        DockAI.updateDockingUndocking(timeStep, station, 5, AutoTrader.doTransaction, AutoTrader.finishedDock)
+    else
+        -- TODO: I've seen the trader get stuck here
+        -- merchant ship, fly close to it, as if we're going to dock
+        -- don't use CheckShipDocked from lib/player.lua because it will send
+        -- chat message errors
+        if station:getNearestDistance(entity) <= 50 then
+            -- close enough, do the transaction and we're done
+            AutoTrader.doTransaction(entity, station)
+            AutoTrader.finishedDock(entity, "Trading is now over")
+        else
+            -- need to get closer
+            ShipAI(entity):setFly(station.translationf, 0)
+        end
+    end
+end
+
+function AutoTrader.doTransaction(ship, station)
     local script
     local invokedFnc
     local amountToTrade
@@ -380,19 +488,42 @@ function doTransaction(ship, station)
     end
 end
 
-function finishedDock(ship, msg)
-    print("finished docking: %1%", msg)
+-- This function adds optional interaction with TradeBeacons mod from @MrKMG
+-- in particular, this will trigger local trade beacons to update trade info
+-- e.g. right after we buy or sell a good
+function AutoTrader.kickLocalTradeBeacons()
+    print("AutoTrader: kicking trade beacons...")
+    local beacons = {Sector():getEntitiesByScript("entity/tradebeacon.lua")}
+    local parentFaction = getParentFaction()
+    for _, beacon in pairs(beacons) do
+        print("AutoTrader: kicking beacon %1%", beacon.title)
+        if beacon.factionIndex == beacon.factionIndex then
+            local ok, ret = beacon:invokeFunction("entity/tradebeacon.lua", "registerWithPlyer")
+            if not ok then
+                print("AutoTrader: error kicking %1%", beacon.title)
+            end
+        end
+    end
+    print("AutoTrader: done kicking trade beacons.")
+end
+
+function AutoTrader.finishedDock(ship, msg)
     DockAI.reset()
     if state == States.Buy then
-        -- TODO: optionally kick any trade beacons in the sector to register their info
+        -- kick any local trade beacons to update trading data 
+        AutoTrader.kickLocalTradeBeacons()
+
         print("AutoTrader: travel to sell")
         JumpAI.reset()
         state = States.TravelToSell
     elseif state == States.Sell then
-        -- TODO: optionally kick any trade beacons in the sector to register their info
+        -- kick any local trade beacons to update trading data 
+        AutoTrader.kickLocalTradeBeacons()
+
         print("AutoTrader: done")
         state = States.Done
     else
         print("got unexpected state while finishing AutoTrader transaction")
+        state = States.Stuck
     end
 end
