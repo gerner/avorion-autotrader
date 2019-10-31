@@ -1,6 +1,8 @@
 package.path = package.path .. ";data/scripts/lib/?.lua"
 
 include("utility")
+include("autotraderutility")
+
 DockAI = include("entity/ai/dock")
 JumpAI = include("entity/ai/jump")
 
@@ -28,10 +30,11 @@ local noRouteNotificationPeriod = 60
 
 --optional filters on buying and selling
 -- {
---     coords = nil,
---     distance = nil,
---     script = nil,
---     goodName = nil
+--     coords = nil, -- coordinates where to make the buy or sell
+--     distance = nil, -- max distance from coords if not nil or max distance to travel for buy or sell
+--     script = nil, -- only buy/sell from this script
+--     station = nil, -- only buy/sell from stations whose title matches this
+--     goodName = nil -- only trade goods with this name
 -- }
 local filterBuy = nil
 local filterSell = nil
@@ -41,15 +44,44 @@ local filterSell = nil
 -- this is just an estimate to compare routes in terms of profit/time
 local dockingOverheadTime = 3
 
+local claimedRoutes = {}
+-- list of claims:
+--  goodName
+--  buyIndex
+--  amountToBuy
+--  sellIndex
+--  amountToSell
+
 function AutoTrader.initialize()
+    print("AutoTrader: initializing")
+    -- make sure our parent faction has the coordination script
+    -- TODO: will this work from our current context? shouldn't this happen in some init script somewhere?
+    local parent = getParentFaction()
+    if parent.isPlayer then
+        parent = Player(parent.index)
+    elseif parent.isAlliance then
+        parent = Alliance(parent.index)
+    end --else it's an AIFaction?
+
+    parent:addScriptOnce("data/scripts/player/autotrader.lua")
+    print("added script to parent faction")
+
+    local x, y = Sector():getCoordinates()
+    invokeRemoteFactionFunction(getParentFaction().index, "autotrader.lua", "requestClaims", x, y, Entity().index)
+
     -- kick tradingoverview to get data ready for us
     Entity():invokeFunction("tradingoverview.lua", "getData")
 
     -- TODO: handle being restored from disk
-    searchInterval = 0.5
+    searchInterval = 1
     state = States.Search
+    AutoTrader.clearOurClaims()
 
     -- TODO: callbacks for cargo changing to keep track of trades actually working
+end
+
+function AutoTrader.onDelete()
+    AutoTrader.clearOurClaims()
 end
 
 -- TODO: secure and restore methods
@@ -67,10 +99,10 @@ function AutoTrader.getUpdateInterval()
         -- periodically search for an updated trade route
         return searchInterval
     elseif state == States.Stuck then
-        return 60
+        return 120
     else
         -- frequently update because we're doing active stuff like docking
-        return 0.5
+        return 5
     end
 end
 
@@ -116,6 +148,7 @@ function AutoTrader.updateServer(timeStep)
         AutoTrader.StateDone(timeStep, entity)
     else
         -- Stuck or some other unknown state
+        AutoTrader.clearOurClaims()
         ShipAI():setStatus("Error in AutoTrader"%_T, {})
     end
 end
@@ -136,6 +169,8 @@ function AutoTrader.StateSearch(timeStep, entity)
     if foundRoute then
         print("AutoTrader: found a route")
         printTable(foundRoute)
+
+        AutoTrader.claimRoute(routeCandidate)
         route = foundRoute
 
         if route.amountToBuy > 0 then
@@ -152,6 +187,9 @@ function AutoTrader.StateSearch(timeStep, entity)
         print("AutoTrader: no trade route found, will continue to search")
         -- let's wait a while before we look again
         searchInterval = 30
+        -- update our view of claimed routes
+        local x, y = Sector():getCoordinates()
+        invokeRemoteFactionFunction(getParentFaction().index, "autotrader.lua", "requestClaims", x, y, entity.index)
 
         -- periodically notify the player/faction
         if noRouteNotificationTimer <= 0 then
@@ -204,12 +242,89 @@ function AutoTrader.StateDone(timeStep, entity)
     -- kick tradingoverview to get data ready for us
     entity:invokeFunction("tradingoverview.lua", "getData")
 
-    -- wait a few seconds for tradingoverview to catch up, then search
-    searchInterval = 5
+    -- release our claim
+    AutoTrader.clearOurClaims()
+
+    -- update our view of claimed routes
+    local x, y = Sector():getCoordinates()
+    invokeRemoteFactionFunction(getParentFaction().index, "autotrader.lua", "requestClaims", x, y, entity.index)
+
+    -- wait a bit for tradingoverview to catch up, then search
+    searchInterval = 1
     state = States.Search
 end
 
--- helpers
+-- multiple traders coordination functions
+
+function AutoTrader.receiveClaimedRoutes(claims)
+    claimedRoutes = RouteSerializer.deserializeClaims(claims)
+end
+-- TODO: do we need to declare this callable?
+-- callable(AutoTrader, "receiveClaimedRoutes")
+
+function AutoTrader.conflictsWithClaims(entity, routeCandidate)
+    -- we should not grab a route which can't be fulfilled if existing
+    -- routes are fulfilled
+    -- stuff to check for
+    -- not enough stock for claims buys + our route
+    -- not enough space for claim sells + our route
+    -- TODO: not enough cash claim buys + our route (seems like an edge condition)
+
+    -- TODO: what if one of the claims already made a purchase, so our view of stock has already taken that into account?
+    local totalBuy = 0
+    local totalSell = 0
+    for entityIndex, claim in pairs(claimedRoutes) do
+
+        -- only care about claims on the same good
+        if claim.goodName ~= routeCandidate.buyable.good.name then
+            goto continue
+        end
+
+        -- skip our own claims
+        if entityIndex == entity.index then
+            goto continue
+        end
+
+        -- check buy-side
+        if routeCandidate.buyable.stationIndex == claim.buyIndex then
+            totalBuy  = totalBuy + claim.amountToBuy
+        end
+
+        if routeCandidate.sellable.stationIndex == claim.sellIndex then
+            totalSell = totalSell + claim.amountToSell
+        end
+
+        ::continue::
+    end
+
+    if routeCandidate.amountToBuy > 0 and routeCandidate.buyable.stock < totalBuy + routeCandidate.amountToBuy then
+        return true
+    end
+
+    if routeCandidate.amountToSell > 0 and (routeCandidate.maxStock - routeCandidate.stock) < totalSell + routeCandidate.amountToSell < 0 then
+        return true
+    end
+
+    return false
+end
+
+function AutoTrader.claimRoute(routeCandidate)
+    -- add to a faction-wide list of claimed routes
+    -- TBD: remove any claims from us just to clean up?
+    --  other reasons claims could go stale?
+
+    invokeRemoteFactionFunction(getParentFaction().index, "autotrader.lua", "claimRoute", Entity().index, RouteSerializer.serializeClaim(RouteSerializer.routeToClaim(routeCandidate)))
+    return
+end
+
+function AutoTrader.clearOurClaims()
+    -- remove claims from our Entity from a faction-wide list of claims
+
+    invokeRemoteFactionFunction(getParentFaction().index, "autotrader.lua", "clearClaims", Entity().index)
+    return
+end
+
+-- finding a route functions
 
 function AutoTrader.loadFilters(entity)
     local buyCoords = entity:getValue("AutoTrader_filterBuy_coords")
@@ -332,7 +447,8 @@ function AutoTrader.findRoute(ship)
                 coords = vec2(x, y),
                 stock = 0,
                 script = "self",
-                station = "self"
+                station = "self",
+                stationIndex = "self"
             }
             table.insert(routes, {buyable = buyable, sellable = sellable})
         end
@@ -377,26 +493,33 @@ function AutoTrader.findRoute(ship)
         return a.profit / a.routeTime > b.profit / b.routeTime
     end
 
+    local ret = nil
     table.sort(routes, sortFn)
     for _, routeCandidate in pairs(routes) do
         if not AutoTrader.filterTrade(filterBuy, routeCandidate.buyable, currentCoords) then
             goto continue
         end
 
-        if routeCandidate.amountToSell > 0 then
-            if not AutoTrader.filterTrade(filterSell, routeCandidate.sellable, routeCandidate.buyable.coords) then
-                goto continue
-            end
-            return routeCandidate
+        if not AutoTrader.filterTrade(filterSell, routeCandidate.sellable, routeCandidate.buyable.coords) then
+            goto continue
         end
 
         -- TODO: any case where we'd consider buy-only route?
         -- e.g. stockpiling goods
+        if routeCandidate.amountToSell <= 0 then
+            goto continue
+        end
 
+        if AutoTrader.conflictsWithClaims(routeCandidate) then
+            goto continue
+        end
+
+        ret = routeCandidate
+        break
         ::continue::
     end
 
-    return nil
+    return ret
 end
 
 -- JumpAI functions
@@ -439,6 +562,7 @@ function AutoTrader.dockAndTrade(timeStep, entity, station)
         DockAI.updateDockingUndocking(timeStep, station, 5, AutoTrader.doTransaction, AutoTrader.finishedDock)
     else
         -- TODO: I've seen the trader get stuck here
+
         -- merchant ship, fly close to it, as if we're going to dock
         -- don't use CheckShipDocked from lib/player.lua because it will send
         -- chat message errors
@@ -497,7 +621,7 @@ function AutoTrader.kickLocalTradeBeacons()
     local parentFaction = getParentFaction()
     for _, beacon in pairs(beacons) do
         print("AutoTrader: kicking beacon %1%", beacon.title)
-        if beacon.factionIndex == beacon.factionIndex then
+        if parentFaction.index == beacon.factionIndex then
             local ok, ret = beacon:invokeFunction("entity/tradebeacon.lua", "registerWithPlyer")
             if not ok then
                 print("AutoTrader: error kicking %1%", beacon.title)
